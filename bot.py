@@ -1,0 +1,265 @@
+﻿import logging
+import os
+import re
+from typing import Optional, Tuple
+
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE":
+    raise RuntimeError(
+        "BOT_TOKEN не задан. Создай файл .env и вставь токен от @BotFather."
+    )
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+menu_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+menu_keyboard.add(KeyboardButton("Время -> Темп"), KeyboardButton("Темп -> Время"))
+menu_keyboard.add(KeyboardButton("Помощь"), KeyboardButton("О боте"))
+
+cancel_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+cancel_keyboard.add(KeyboardButton("Отмена"))
+
+
+class PaceCalcStates(StatesGroup):
+    waiting_time_distance = State()
+    waiting_pace_distance = State()
+
+
+def parse_distance(raw: str) -> Optional[float]:
+    normalized = re.sub(
+        r"(км|km|километр(?:а|ов)?)",
+        "",
+        raw.strip().lower(),
+    ).strip().replace(",", ".")
+
+    try:
+        distance = float(normalized)
+    except ValueError:
+        return None
+
+    if distance <= 0:
+        return None
+
+    return distance
+
+
+def parse_time_to_seconds(raw: str) -> Optional[int]:
+    value = raw.strip().lower()
+    if not value:
+        return None
+
+    parts = value.split(":")
+    if len(parts) == 2:
+        try:
+            minutes, seconds = map(int, parts)
+        except ValueError:
+            return None
+        if minutes < 0 or not (0 <= seconds < 60):
+            return None
+        total = minutes * 60 + seconds
+        return total if total > 0 else None
+
+    if len(parts) == 3:
+        try:
+            hours, minutes, seconds = map(int, parts)
+        except ValueError:
+            return None
+        if hours < 0 or not (0 <= minutes < 60) or not (0 <= seconds < 60):
+            return None
+        total = hours * 3600 + minutes * 60 + seconds
+        return total if total > 0 else None
+
+    compact = value.replace(" ", "")
+    match = re.fullmatch(
+        r"(?:(\d+)(?:ч|час|часа|часов|h|hr|hour|hours))?"
+        r"(?:(\d+)(?:м|мин|минута|минуты|минут|min|m))?"
+        r"(?:(\d+)(?:с|сек|секунда|секунды|секунд|sec|s))?",
+        compact,
+    )
+    if match:
+        hours = int(match.group(1)) if match.group(1) else 0
+        minutes = int(match.group(2)) if match.group(2) else 0
+        seconds = int(match.group(3)) if match.group(3) else 0
+        total = hours * 3600 + minutes * 60 + seconds
+        return total if total > 0 else None
+
+    return None
+
+
+def parse_pace_to_seconds(raw: str) -> Optional[int]:
+    return parse_time_to_seconds(raw)
+
+
+def extract_distance_and_value(raw: str) -> Tuple[Optional[float], Optional[str]]:
+    match = re.match(
+        r"^\s*(\d+(?:[.,]\d+)?)\s*(?:км|km|километр(?:а|ов)?)?\s+(.+?)\s*$",
+        raw.strip().lower(),
+    )
+    if not match:
+        return None, None
+
+    distance = parse_distance(match.group(1))
+    value = match.group(2).strip()
+    return distance, value
+
+
+def format_seconds_to_time(total_seconds: int) -> str:
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def format_seconds_to_pace(total_seconds: int) -> str:
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
+    return f"{minutes}:{seconds:02d}"
+
+
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message) -> None:
+    text = (
+        "Привет! Я калькулятор для бегунов.\n\n"
+        "Что умею:\n"
+        "1) Время + дистанция -> темп (мин/км)\n"
+        "2) Темп + дистанция -> итоговое время\n\n"
+        "Выбери режим кнопкой ниже."
+    )
+    await message.answer(text, reply_markup=menu_keyboard)
+
+
+@dp.message_handler(commands=["help"])
+@dp.message_handler(lambda m: m.text == "Помощь")
+async def cmd_help(message: types.Message) -> None:
+    await message.answer(
+        "Форматы ввода:\n"
+        "- Время: MM:SS, HH:MM:SS или с единицами (24м30с, 1ч5м)\n"
+        "- Темп: MM:SS или с единицами (4:55, 4м55с)\n"
+        "- Дистанция: км, можно дробную (5, 10.5, 21,1км)\n\n"
+        "Режим 'Время -> Темп': отправь строку `дистанция время`\n"
+        "Примеры: `5 24:30`, `5км 24м30с`\n\n"
+        "Режим 'Темп -> Время': отправь строку `дистанция темп`\n"
+        "Примеры: `10 5:20`, `10 км 5м20с`\n\n"
+        "Чтобы выйти из режима, нажми 'Отмена'.",
+        reply_markup=menu_keyboard,
+    )
+
+
+@dp.message_handler(lambda m: m.text == "О боте")
+async def about_bot(message: types.Message) -> None:
+    await message.answer("Бот считает темп и время для беговых тренировок.")
+
+
+@dp.message_handler(lambda m: m.text == "Отмена", state="*")
+async def cancel_state(message: types.Message, state: FSMContext) -> None:
+    if await state.get_state() is not None:
+        await state.finish()
+        await message.answer("Ок, режим сброшен.", reply_markup=menu_keyboard)
+    else:
+        await message.answer("Сейчас нет активного режима.", reply_markup=menu_keyboard)
+
+
+@dp.message_handler(lambda m: m.text == "Время -> Темп")
+async def start_time_to_pace(message: types.Message) -> None:
+    await PaceCalcStates.waiting_time_distance.set()
+    await message.answer(
+        "Отправь: `дистанция время`\nПримеры: `5 24:30`, `5км 24м30с`",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard,
+    )
+
+
+@dp.message_handler(lambda m: m.text == "Темп -> Время")
+async def start_pace_to_time(message: types.Message) -> None:
+    await PaceCalcStates.waiting_pace_distance.set()
+    await message.answer(
+        "Отправь: `дистанция темп`\nПримеры: `10 5:20`, `10 км 5м20с`",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard,
+    )
+
+
+@dp.message_handler(state=PaceCalcStates.waiting_time_distance, content_types=types.ContentType.TEXT)
+async def calculate_pace(message: types.Message, state: FSMContext) -> None:
+    distance, time_raw = extract_distance_and_value(message.text)
+    total_seconds = parse_time_to_seconds(time_raw or "")
+
+    if distance is None:
+        await message.answer(
+            "Не смог прочитать дистанцию. Пример: `5`, `10.5`, `21,1км`",
+            parse_mode="Markdown",
+        )
+        return
+    if total_seconds is None:
+        await message.answer(
+            "Не смог прочитать время. Пример: `24:30`, `01:24:30`, `24м30с`",
+            parse_mode="Markdown",
+        )
+        return
+
+    pace_seconds = round(total_seconds / distance)
+    pace_text = format_seconds_to_pace(pace_seconds)
+
+    await state.finish()
+    await message.answer(
+        f"Дистанция: {distance:g} км\n"
+        f"Время: {format_seconds_to_time(total_seconds)}\n"
+        f"Темп: {pace_text} мин/км",
+        reply_markup=menu_keyboard,
+    )
+
+
+@dp.message_handler(state=PaceCalcStates.waiting_pace_distance, content_types=types.ContentType.TEXT)
+async def calculate_time(message: types.Message, state: FSMContext) -> None:
+    distance, pace_raw = extract_distance_and_value(message.text)
+    pace_seconds = parse_pace_to_seconds(pace_raw or "")
+
+    if distance is None:
+        await message.answer(
+            "Не смог прочитать дистанцию. Пример: `5`, `10.5`, `21,1км`",
+            parse_mode="Markdown",
+        )
+        return
+    if pace_seconds is None:
+        await message.answer(
+            "Не смог прочитать темп. Пример: `4:55` или `4м55с`",
+            parse_mode="Markdown",
+        )
+        return
+
+    total_seconds = round(distance * pace_seconds)
+
+    await state.finish()
+    await message.answer(
+        f"Дистанция: {distance:g} км\n"
+        f"Темп: {format_seconds_to_pace(pace_seconds)} мин/км\n"
+        f"Итоговое время: {format_seconds_to_time(total_seconds)}",
+        reply_markup=menu_keyboard,
+    )
+
+
+@dp.message_handler(content_types=types.ContentType.TEXT)
+async def fallback_text(message: types.Message) -> None:
+    await message.answer(
+        "Выбери режим: 'Время -> Темп' или 'Темп -> Время'.\n"
+        "Если нужно, нажми 'Помощь'.",
+        reply_markup=menu_keyboard,
+    )
+
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
