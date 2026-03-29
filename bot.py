@@ -26,7 +26,8 @@ dp = Dispatcher(bot, storage=storage)
 
 menu_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
 menu_keyboard.add(KeyboardButton("Время -> Темп"), KeyboardButton("Темп -> Время"))
-menu_keyboard.add(KeyboardButton("Помощь"), KeyboardButton("О боте"))
+menu_keyboard.add(KeyboardButton("Калории"), KeyboardButton("Помощь"))
+menu_keyboard.add(KeyboardButton("О боте"))
 
 cancel_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
 cancel_keyboard.add(KeyboardButton("Отмена"))
@@ -35,6 +36,7 @@ cancel_keyboard.add(KeyboardButton("Отмена"))
 class PaceCalcStates(StatesGroup):
     waiting_time_distance = State()
     waiting_pace_distance = State()
+    waiting_calories = State()
 
 
 def parse_distance(raw: str) -> Optional[float]:
@@ -53,6 +55,21 @@ def parse_distance(raw: str) -> Optional[float]:
         return None
 
     return distance
+
+
+def parse_weight(raw: str) -> Optional[float]:
+    normalized = re.sub(
+        r"(кг|kg|килограмм(?:а|ов)?)",
+        "",
+        raw.strip().lower(),
+    ).strip().replace(",", ".")
+    try:
+        weight = float(normalized)
+    except ValueError:
+        return None
+    if weight <= 0:
+        return None
+    return weight
 
 
 def parse_time_to_seconds(raw: str) -> Optional[int]:
@@ -130,13 +147,38 @@ def format_seconds_to_pace(total_seconds: int) -> str:
     return f"{minutes}:{seconds:02d}"
 
 
+def estimate_met(speed_kmh: float) -> float:
+    if speed_kmh < 8.0:
+        return 8.3
+    if speed_kmh < 9.7:
+        return 9.8
+    if speed_kmh < 10.8:
+        return 10.5
+    if speed_kmh < 11.3:
+        return 11.0
+    if speed_kmh < 12.1:
+        return 11.8
+    if speed_kmh < 12.9:
+        return 12.3
+    if speed_kmh < 13.8:
+        return 12.8
+    if speed_kmh < 14.5:
+        return 14.5
+    if speed_kmh < 16.1:
+        return 16.0
+    if speed_kmh < 17.7:
+        return 19.0
+    return 19.8
+
+
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message) -> None:
     text = (
         "Привет! Я калькулятор для бегунов.\n\n"
         "Что умею:\n"
         "1) Время + дистанция -> темп (мин/км)\n"
-        "2) Темп + дистанция -> итоговое время\n\n"
+        "2) Темп + дистанция -> итоговое время\n"
+        "3) Прогноз калорий на пробежке\n\n"
         "Выбери режим кнопкой ниже."
     )
     await message.answer(text, reply_markup=menu_keyboard)
@@ -149,11 +191,16 @@ async def cmd_help(message: types.Message) -> None:
         "Форматы ввода:\n"
         "- Время: MM:SS, HH:MM:SS или с единицами (24м30с, 1ч5м)\n"
         "- Темп: MM:SS или с единицами (4:55, 4м55с)\n"
-        "- Дистанция: км, можно дробную (5, 10.5, 21,1км)\n\n"
+        "- Дистанция: км, можно дробную (5, 10.5, 21,1км)\n"
+        "- Вес: кг (70, 68кг)\n\n"
         "Режим 'Время -> Темп': отправь строку `дистанция время`\n"
         "Примеры: `5 24:30`, `5км 24м30с`\n\n"
         "Режим 'Темп -> Время': отправь строку `дистанция темп`\n"
         "Примеры: `10 5:20`, `10 км 5м20с`\n\n"
+        "Режим 'Калории':\n"
+        "- `дистанция вес` (быстрая оценка)\n"
+        "- `дистанция время вес` (точнее, с учетом скорости)\n"
+        "Примеры: `10 70`, `10 52:30 70`, `21,1км 1:45:00 68кг`\n\n"
         "Чтобы выйти из режима, нажми 'Отмена'.",
         reply_markup=menu_keyboard,
     )
@@ -161,7 +208,7 @@ async def cmd_help(message: types.Message) -> None:
 
 @dp.message_handler(lambda m: m.text == "О боте")
 async def about_bot(message: types.Message) -> None:
-    await message.answer("Бот считает темп и время для беговых тренировок.")
+    await message.answer("Бот считает темп, время и примерный расход калорий.")
 
 
 @dp.message_handler(lambda m: m.text == "Отмена", state="*")
@@ -188,6 +235,18 @@ async def start_pace_to_time(message: types.Message) -> None:
     await PaceCalcStates.waiting_pace_distance.set()
     await message.answer(
         "Отправь: `дистанция темп`\nПримеры: `10 5:20`, `10 км 5м20с`",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard,
+    )
+
+
+@dp.message_handler(lambda m: m.text == "Калории")
+async def start_calories(message: types.Message) -> None:
+    await PaceCalcStates.waiting_calories.set()
+    await message.answer(
+        "Отправь:\n"
+        "`дистанция вес` или `дистанция время вес`\n"
+        "Примеры: `10 70`, `10 52:30 70`, `21,1км 1:45:00 68кг`",
         parse_mode="Markdown",
         reply_markup=cancel_keyboard,
     )
@@ -252,10 +311,76 @@ async def calculate_time(message: types.Message, state: FSMContext) -> None:
     )
 
 
+@dp.message_handler(state=PaceCalcStates.waiting_calories, content_types=types.ContentType.TEXT)
+async def calculate_calories(message: types.Message, state: FSMContext) -> None:
+    parts = message.text.strip().split()
+    if len(parts) not in (2, 3):
+        await message.answer(
+            "Нужен формат: `дистанция вес` или `дистанция время вес`.\n"
+            "Примеры: `10 70`, `10 52:30 70`",
+            parse_mode="Markdown",
+        )
+        return
+
+    distance = parse_distance(parts[0])
+    if distance is None:
+        await message.answer(
+            "Не смог прочитать дистанцию. Пример: `10`, `21,1км`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if len(parts) == 2:
+        weight = parse_weight(parts[1])
+        if weight is None:
+            await message.answer(
+                "Не смог прочитать вес. Пример: `70` или `68кг`",
+                parse_mode="Markdown",
+            )
+            return
+        kcal = round(distance * weight * 1.036)
+        method = "быстрая оценка"
+        details = ""
+    else:
+        total_seconds = parse_time_to_seconds(parts[1])
+        weight = parse_weight(parts[2])
+        if total_seconds is None:
+            await message.answer(
+                "Не смог прочитать время. Пример: `52:30` или `1:05:40`",
+                parse_mode="Markdown",
+            )
+            return
+        if weight is None:
+            await message.answer(
+                "Не смог прочитать вес. Пример: `70` или `68кг`",
+                parse_mode="Markdown",
+            )
+            return
+        hours = total_seconds / 3600
+        speed_kmh = distance / hours
+        met = estimate_met(speed_kmh)
+        kcal = round(met * weight * hours)
+        method = "оценка с учетом скорости (MET)"
+        details = (
+            f"\nВремя: {format_seconds_to_time(total_seconds)}"
+            f"\nСредняя скорость: {speed_kmh:.2f} км/ч"
+        )
+
+    await state.finish()
+    await message.answer(
+        f"Дистанция: {distance:g} км\n"
+        f"Вес: {weight:g} кг"
+        f"{details}\n"
+        f"Расход: ~{kcal} ккал\n"
+        f"Метод: {method}",
+        reply_markup=menu_keyboard,
+    )
+
+
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def fallback_text(message: types.Message) -> None:
     await message.answer(
-        "Выбери режим: 'Время -> Темп' или 'Темп -> Время'.\n"
+        "Выбери режим: 'Время -> Темп', 'Темп -> Время' или 'Калории'.\n"
         "Если нужно, нажми 'Помощь'.",
         reply_markup=menu_keyboard,
     )
