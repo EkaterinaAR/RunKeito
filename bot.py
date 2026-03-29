@@ -274,6 +274,7 @@ async def about_bot(message: types.Message) -> None:
     await message.answer("Бот считает темп, время, калории и хранит историю расчетов.")
 
 
+@dp.message_handler(commands=["history"])
 @dp.message_handler(lambda m: m.text == "История")
 async def show_history(message: types.Message) -> None:
     rows = get_history(message.from_user.id, limit=10)
