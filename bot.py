@@ -30,7 +30,8 @@ dp = Dispatcher(bot, storage=storage)
 menu_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
 menu_keyboard.add(KeyboardButton("Время -> Темп"), KeyboardButton("Темп -> Время"))
 menu_keyboard.add(KeyboardButton("Калории"), KeyboardButton("История"))
-menu_keyboard.add(KeyboardButton("Помощь"), KeyboardButton("О боте"))
+menu_keyboard.add(KeyboardButton("Очистить историю"), KeyboardButton("Помощь"))
+menu_keyboard.add(KeyboardButton("О боте"))
 
 cancel_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
 cancel_keyboard.add(KeyboardButton("Отмена"))
@@ -98,6 +99,12 @@ def get_history(user_id: int, limit: int = 10) -> list[tuple[str, str, str, str]
             (user_id, limit),
         ).fetchall()
     return rows
+
+
+def clear_history(user_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
+        conn.commit()
 
 
 def parse_distance(raw: str) -> Optional[float]:
@@ -264,6 +271,7 @@ async def cmd_help(message: types.Message) -> None:
         "- `дистанция время вес` (точнее, с учетом скорости)\n"
         "Примеры: `10 70`, `10 52:30 70`, `21,1км 1:45:00 68кг`\n\n"
         "Кнопка 'История' показывает 10 последних расчетов.\n"
+        "Кнопка/команда 'Очистить историю' удаляет сохраненные расчеты.\n"
         "Чтобы выйти из режима, нажми 'Отмена'.",
         reply_markup=menu_keyboard,
     )
@@ -290,6 +298,13 @@ async def show_history(message: types.Message) -> None:
         lines.append(f"   Результат: {result_text}")
 
     await message.answer("\n".join(lines), reply_markup=menu_keyboard)
+
+
+@dp.message_handler(commands=["clear_history"])
+@dp.message_handler(lambda m: m.text == "Очистить историю")
+async def clear_user_history(message: types.Message) -> None:
+    clear_history(message.from_user.id)
+    await message.answer("История очищена.", reply_markup=menu_keyboard)
 
 
 @dp.message_handler(lambda m: m.text == "Отмена", state="*")
