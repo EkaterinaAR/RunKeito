@@ -1,6 +1,7 @@
 ﻿import logging
 import os
 import re
+import sqlite3
 from typing import Optional, Tuple
 
 from aiogram import Bot, Dispatcher, executor, types
@@ -18,6 +19,8 @@ if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE":
         "BOT_TOKEN не задан. Создай файл .env и вставь токен от @BotFather."
     )
 
+DB_PATH = "history.db"
+
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
@@ -26,8 +29,8 @@ dp = Dispatcher(bot, storage=storage)
 
 menu_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
 menu_keyboard.add(KeyboardButton("Время -> Темп"), KeyboardButton("Темп -> Время"))
-menu_keyboard.add(KeyboardButton("Калории"), KeyboardButton("Помощь"))
-menu_keyboard.add(KeyboardButton("О боте"))
+menu_keyboard.add(KeyboardButton("Калории"), KeyboardButton("История"))
+menu_keyboard.add(KeyboardButton("Помощь"), KeyboardButton("О боте"))
 
 cancel_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
 cancel_keyboard.add(KeyboardButton("Отмена"))
@@ -37,6 +40,64 @@ class PaceCalcStates(StatesGroup):
     waiting_time_distance = State()
     waiting_pace_distance = State()
     waiting_calories = State()
+
+
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                input_text TEXT NOT NULL,
+                result_text TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.commit()
+
+
+def save_history(user_id: int, mode: str, input_text: str, result_text: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO history (user_id, mode, input_text, result_text)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, mode, input_text.strip(), result_text.strip()),
+        )
+        # Keep only latest 10 records per user.
+        conn.execute(
+            """
+            DELETE FROM history
+            WHERE user_id = ?
+              AND id NOT IN (
+                SELECT id FROM history
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 10
+              )
+            """,
+            (user_id, user_id),
+        )
+        conn.commit()
+
+
+def get_history(user_id: int, limit: int = 10) -> list[tuple[str, str, str, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT created_at, mode, input_text, result_text
+            FROM history
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+    return rows
 
 
 def parse_distance(raw: str) -> Optional[float]:
@@ -178,7 +239,8 @@ async def cmd_start(message: types.Message) -> None:
         "Что умею:\n"
         "1) Время + дистанция -> темп (мин/км)\n"
         "2) Темп + дистанция -> итоговое время\n"
-        "3) Прогноз калорий на пробежке\n\n"
+        "3) Прогноз калорий на пробежке\n"
+        "4) История последних 10 расчетов\n\n"
         "Выбери режим кнопкой ниже."
     )
     await message.answer(text, reply_markup=menu_keyboard)
@@ -201,6 +263,7 @@ async def cmd_help(message: types.Message) -> None:
         "- `дистанция вес` (быстрая оценка)\n"
         "- `дистанция время вес` (точнее, с учетом скорости)\n"
         "Примеры: `10 70`, `10 52:30 70`, `21,1км 1:45:00 68кг`\n\n"
+        "Кнопка 'История' показывает 10 последних расчетов.\n"
         "Чтобы выйти из режима, нажми 'Отмена'.",
         reply_markup=menu_keyboard,
     )
@@ -208,7 +271,24 @@ async def cmd_help(message: types.Message) -> None:
 
 @dp.message_handler(lambda m: m.text == "О боте")
 async def about_bot(message: types.Message) -> None:
-    await message.answer("Бот считает темп, время и примерный расход калорий.")
+    await message.answer("Бот считает темп, время, калории и хранит историю расчетов.")
+
+
+@dp.message_handler(lambda m: m.text == "История")
+async def show_history(message: types.Message) -> None:
+    rows = get_history(message.from_user.id, limit=10)
+    if not rows:
+        await message.answer("История пока пуста. Сделай первый расчет.", reply_markup=menu_keyboard)
+        return
+
+    lines = ["Последние расчеты:"]
+    for idx, (created_at, mode, input_text, result_text) in enumerate(rows, start=1):
+        ts = created_at.replace("T", " ")
+        lines.append(f"{idx}. [{ts}] {mode}")
+        lines.append(f"   Ввод: {input_text}")
+        lines.append(f"   Результат: {result_text}")
+
+    await message.answer("\n".join(lines), reply_markup=menu_keyboard)
 
 
 @dp.message_handler(lambda m: m.text == "Отмена", state="*")
@@ -273,11 +353,14 @@ async def calculate_pace(message: types.Message, state: FSMContext) -> None:
     pace_seconds = round(total_seconds / distance)
     pace_text = format_seconds_to_pace(pace_seconds)
 
+    result_text = f"Темп: {pace_text} мин/км"
+    save_history(message.from_user.id, "Время -> Темп", message.text, result_text)
+
     await state.finish()
     await message.answer(
         f"Дистанция: {distance:g} км\n"
         f"Время: {format_seconds_to_time(total_seconds)}\n"
-        f"Темп: {pace_text} мин/км",
+        f"{result_text}",
         reply_markup=menu_keyboard,
     )
 
@@ -302,11 +385,14 @@ async def calculate_time(message: types.Message, state: FSMContext) -> None:
 
     total_seconds = round(distance * pace_seconds)
 
+    result_text = f"Итоговое время: {format_seconds_to_time(total_seconds)}"
+    save_history(message.from_user.id, "Темп -> Время", message.text, result_text)
+
     await state.finish()
     await message.answer(
         f"Дистанция: {distance:g} км\n"
         f"Темп: {format_seconds_to_pace(pace_seconds)} мин/км\n"
-        f"Итоговое время: {format_seconds_to_time(total_seconds)}",
+        f"{result_text}",
         reply_markup=menu_keyboard,
     )
 
@@ -366,12 +452,15 @@ async def calculate_calories(message: types.Message, state: FSMContext) -> None:
             f"\nСредняя скорость: {speed_kmh:.2f} км/ч"
         )
 
+    result_text = f"Расход: ~{kcal} ккал"
+    save_history(message.from_user.id, "Калории", message.text, result_text)
+
     await state.finish()
     await message.answer(
         f"Дистанция: {distance:g} км\n"
         f"Вес: {weight:g} кг"
         f"{details}\n"
-        f"Расход: ~{kcal} ккал\n"
+        f"{result_text}\n"
         f"Метод: {method}",
         reply_markup=menu_keyboard,
     )
@@ -380,11 +469,12 @@ async def calculate_calories(message: types.Message, state: FSMContext) -> None:
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def fallback_text(message: types.Message) -> None:
     await message.answer(
-        "Выбери режим: 'Время -> Темп', 'Темп -> Время' или 'Калории'.\n"
+        "Выбери режим: 'Время -> Темп', 'Темп -> Время', 'Калории' или 'История'.\n"
         "Если нужно, нажми 'Помощь'.",
         reply_markup=menu_keyboard,
     )
 
 
 if __name__ == "__main__":
+    init_db()
     executor.start_polling(dp, skip_updates=True)
