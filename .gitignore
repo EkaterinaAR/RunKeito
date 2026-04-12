@@ -1,7 +1,4 @@
-.venv/
+﻿.venv/
 __pycache__/
 .env
-.env.*
-!.env.example
-!.env.*.example
 history.db

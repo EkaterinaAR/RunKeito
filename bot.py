@@ -2,7 +2,7 @@
 import os
 import re
 import sqlite3
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -11,10 +11,9 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=".env.calculator")
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN_CALCULATOR") or os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE":
     raise RuntimeError(
         "BOT_TOKEN не задан. Создай файл .env и вставь токен от @BotFather."
@@ -87,7 +86,7 @@ def save_history(user_id: int, mode: str, input_text: str, result_text: str) -> 
         conn.commit()
 
 
-def get_history(user_id: int, limit: int = 10) -> List[Tuple[str, str, str, str]]:
+def get_history(user_id: int, limit: int = 10) -> list[tuple[str, str, str, str]]:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             """
