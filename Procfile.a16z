@@ -1,0 +1,1 @@
+worker: python a16z_fintech_bot.py
